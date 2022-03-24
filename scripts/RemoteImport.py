@@ -1,3 +1,37 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+-----------------------------------------------------------------------------
+  Copyright (C) 2021-2022 Susanne Kunis. All rights reserved.
+
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 2 of the License, or
+  (at your option) any later version.
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License along
+  with this program; if not, write to the Free Software Foundation, Inc.,
+  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+------------------------------------------------------------------------------
+
+This script import images from a mounted directory into OMERO via cli import into the selected
+project or dataset dir. Attachment of non-image files to dataset or project directory if required.
+This can be limited to certain file extensions.
+The mounted source path is MOUNT_PATH/WORKSTATION_NAME[i]/<omero_username> (see also checkWorkstation())and import from the source system a
+dedicated <omero_username> directory (implemented via automount).
+
+
+@author Susanne Kunis
+<a href="mailto:sinukesus@gmail.com">sinukesus@gmail.com</a>
+@version 1.1.0
+"""
+
 
 import omero.scripts as scripts
 from omero.gateway import BlitzGateway
@@ -7,24 +41,24 @@ import omero
 import omero.cli
 from omero.rtypes import rstring,unwrap,rlong,robject
 
-import shlex
-import subprocess
 import time
 import tempfile
 from pathlib import Path
 import threading
-import datetime
 import glob
+
 
 ############### CONFIGURATIONS ######################################
 # Set the number of directories to scan down for files :
 DEPTH= 10
+# path of the directory for automount
+MOUNT_PATH = "/AutoMountDir/"
+# Name of the system registered with Automount
+WORKSTATION_NAMES=["system1","system2"]
 
-MOUNT_PATH = "/Importer/"
-WORKSTATION_NAME="cn-imaris"
-WORKSTATION_NS="Imaris"
 #####################################################################
 
+PARAM_WS = "Workstations"
 PARAM_DATATYPE = "Data_Type"
 PARAM_ID = "IDs"
 PARAM_ATTACH = "Attach non image files"
@@ -225,7 +259,7 @@ def attachFiles(conn, destID, destType,values,srcPath,namespace,depth):
         print('ERROR: attach file: %s\n %s %s'%(str(e),exc_type, exc_tb.tb_lineno))
 
 
-def cliImport(client,ipath,destID,skip,depth,dataset=None,conn=None):
+def cliImport(client,ipath,destID,skip,depth,namespace,dataset=None,conn=None):
     # create import call string
     args = createArgumentList(ipath,destID,skip,depth)
 
@@ -251,7 +285,7 @@ def cliImport(client,ipath,destID,skip,depth,dataset=None,conn=None):
                     #append log file
                     #link reportFile to object
                     ann = conn.createFileAnnfromLocalFile(
-                        stderr.name, mimetype="text/csv",ns=WORKSTATION_NS+"_log" )
+                        stderr.name, mimetype="text/csv",ns=namespace+"_log" )
                     dataset.linkAnnotation(ann)
 
                 return images_skipped,images_imported,stderr
@@ -265,7 +299,7 @@ def cliImport(client,ipath,destID,skip,depth,dataset=None,conn=None):
 
 
 
-def retryImport(client, destinationID, filesForNewlyImport, images_skipped, numOfImportedFiles, skip):
+def retryImport(client, destinationID, filesForNewlyImport, images_skipped, numOfImportedFiles, skip,namespace):
     # retry failed imports
     not_imported_imgList = []
     messageRetry = ""
@@ -277,7 +311,7 @@ def retryImport(client, destinationID, filesForNewlyImport, images_skipped, numO
         for f in filesForNewlyImport:
             print("Retry import for: ", f)
             messageRetry = messageRetry + "\n" + f
-            r_images_skipped, r_images_imported,log = cliImport(client, f,destinationID,skip,1)
+            r_images_skipped, r_images_imported,log = cliImport(client, f,destinationID,skip,1,namespace)
 
             # now the file should be imported or skipped
             if r_images_imported is not None and len(r_images_imported) > 0:
@@ -290,8 +324,9 @@ def retryImport(client, destinationID, filesForNewlyImport, images_skipped, numO
 
 
 
-def importContent(conn, params,jobs,namespace,depth):
+def importContent(conn, params,jobs,depth):
     try:
+        namespace = params.get(PARAM_WS)
         client = conn.c
         #see https://lists.openmicroscopy.org.uk/pipermail/ome-users/2014-September/004783.html
         router = client.getProperty("Ice.Default.Router")
@@ -306,6 +341,7 @@ def importContent(conn, params,jobs,namespace,depth):
         re = s.createRenderingEngine()
 
         #see also https://gist.github.com/jacques2020/ee863e83c3e2b663d68f
+        # necessary anymore?
         class KeepAlive(threading.Thread):
             def run(self):
                 self.stop = False
@@ -336,7 +372,7 @@ def importContent(conn, params,jobs,namespace,depth):
 
                     # call import
                     print("\n Import files from : %s \n"%ipath)
-                    images_skipped,images_imported,log=cliImport(client,ipath,destID,skip,depth,destDataset,conn)
+                    images_skipped,images_imported,log=cliImport(client,ipath,destID,skip,depth,namespace,destDataset,conn)
 
                     # validate import
                     filesForNewlyImport,other_fList=validateImport(images_skipped,images_imported,ipath)
@@ -346,16 +382,15 @@ def importContent(conn, params,jobs,namespace,depth):
                         attachFiles(conn,destID,params.get(PARAM_DEST_ATTACH),
                                     params.get(PARAM_ATTACH_FILTER),ipath,namespace,depth)
 
-                    messageRetry,not_imported_imgList,images_skipped,numOfImportedFiles, retry = retryImport(client, destID, filesForNewlyImport,
-                                                                          images_skipped, len(images_imported),
-                                                                          skip)
+                    messageRetry,not_imported_imgList,images_skipped,numOfImportedFiles, retry = \
+                        retryImport(client, destID, filesForNewlyImport,images_skipped, len(images_imported),skip,namespace)
 
                     message="Imports Finished! "
 
                     all_notImported_img.extend(not_imported_imgList)
                     all_skipped_img.extend(images_skipped)
 
-    # todo attach files in separates try catch
+
     except Exception as e: # work on python 3.x
         exc_type, exc_obj, exc_tb = sys.exc_info()
         print ('ERROR: Failed to import: %s\n %s %s'%(str(e),exc_type, exc_tb.tb_lineno))
@@ -410,7 +445,7 @@ def scanSubdir(conn,currentdir,pName,jobs,destObj):
     return jobs
 
 # jobs={path_0:tID_0,...,path_N:tID_N}
-def getJobsAndTargets(conn,datapath,destType,destID,destObj):
+def getJobsAndTargets(conn,datapath,destType,destID,destObj,namespace):
     '''Returns list of src paths and list of target object ids'''
     if destType=="Dataset":
         # only file paths
@@ -419,7 +454,7 @@ def getJobsAndTargets(conn,datapath,destType,destID,destObj):
         return jobs,DEPTH
     else: # target = project
         # create common dataset for direct files under Omero_Importdir/<user>/
-        datasetName = WORKSTATION_NS
+        datasetName = namespace
         existingID = existsAsChildOf(destObj,datasetName)
 
         if not existingID:
@@ -429,27 +464,35 @@ def getJobsAndTargets(conn,datapath,destType,destID,destObj):
         jobs[datapath]=existingID
 
         # create datasets like directories
-        subdirs = filter(os.path.isdir, [os.path.join(datapath, x) for x in os.listdir(datapath)])
-        for dir in subdirs:
-            jobs = scanSubdir(conn,dir,None,jobs,destObj)
+        try:
+            subdirs = filter(os.path.isdir, [os.path.join(datapath, x) for x in os.listdir(datapath)])
+            for dir in subdirs:
+                jobs = scanSubdir(conn,dir,None,jobs,destObj)
+        except Exception as e:
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            print('ERROR: while reading mount dir: %s\n %s %s'%(str(e),exc_type, exc_tb.tb_lineno))
+            return None,1
 
         return jobs,1
 
-def remoteImport(conn,params,datapath,namespace):
+def remoteImport(conn,params,datapath):
     destID,destObj,destType=getImportTarget(conn,params)
     if destObj is None:
-        return "ERROR: No correct target specified for import data!"
+        return None,"ERROR: No correct target specified for import data!"
 
     if destType != "Dataset" and destType !="Project":
-        return "ERROR:Please specify as target dataset or project!"
+        return None,"ERROR:Please specify as target dataset or project!"
 
     startTime = time.time()
 
-    jobs,depth = getJobsAndTargets(conn,datapath,destType,destID,destObj)
+    jobs,depth = getJobsAndTargets(conn,datapath,destType,destID,destObj,params.get(PARAM_WS))
+    if jobs is None:
+        return destObj,"No files found!"
+
     for key in jobs:
         print(key, '->', jobs[key])
 
-    message = importContent(conn, params,jobs,namespace,depth)
+    message = importContent(conn, params,jobs,depth)
 
     endTime = time.time()
     print("Duration Import: ", str(endTime - startTime))
@@ -471,6 +514,7 @@ def checkWorkstation(conn,workstation_name,mnt_path,userName):
         print("Check userdir on mountpath: ",serverPath)
         if not os.path.isdir(serverPath):
             print('ERROR: No data available on remote system for user: ',userName)
+            return None
         else:
             print("==> available")
 
@@ -494,11 +538,12 @@ def run_script():
     scripting service, passing the required parameters.
     """
     client = scripts.client(
-        'Remote_Import_Imaris.py',
-        """Remote import from Imaris Workstation:
+        'Remote_Import.py',
+        """Remote import from dedicated workstations:
 
-        * Import the content of the OMERO_ImportData/<username>/ folder on the Imaris workstation.
+        * Import the content of the OMERO_ImportData/<username>/ folder on the selected workstation.
         * Appends files with the specified suffix to the Project or Dataset.
+        * The scanned subfolder depth is 10
         ---------------------------------------------------------------
         INPUT:
         ---------------------------------------------------------------
@@ -508,26 +553,29 @@ def run_script():
 
 
         """,
-        scripts.String(PARAM_DATATYPE, optional=True, grouping="1",
+        scripts.String(PARAM_WS, optional=False, grouping="1",
+                       description="Choose a workstation where you want to import from",
+                       values=WORKSTATION_NAMES),
+        scripts.String(PARAM_DATATYPE, optional=True, grouping="2",
                        description="Choose kind of destination object.",
                        values=dataTypes),
-        scripts.Long(PARAM_ID, optional=True, grouping="2",
+        scripts.Long(PARAM_ID, optional=False, grouping="3",
                      description="ID of destination object. Please select only ONE object."),
-        scripts.Bool(PARAM_SKIP_EXISTING, grouping="3",
+        scripts.Bool(PARAM_SKIP_EXISTING, grouping="4",
                      description="skip files that are already uploaded (checked 'import from' path).",
                      default=False),
-        scripts.Bool(PARAM_ATTACH, grouping="4",
+        scripts.Bool(PARAM_ATTACH, grouping="5",
                      description="Attach containing non image files", default=False),
-        scripts.String(PARAM_DEST_ATTACH, grouping="4.1",
+        scripts.String(PARAM_DEST_ATTACH, grouping="5.1",
                        description="Object to that should be attach",
                        values=dataTypes_attach, default="Dataset"),
-        scripts.String(PARAM_ATTACH_FILTER, grouping="4.2",
+        scripts.String(PARAM_ATTACH_FILTER, grouping="5.2",
                        description="Filter files by given file extension (for example txt, pdf). Separated by ','."),
         namespaces=[omero.constants.namespaces.NSDYNAMIC],
-        version="1.0.0",
+        version="1.1.0",
         authors=["Susanne Kunis", "CellNanOs"],
         institutions=["University of Osnabrueck"],
-        contact="sukunis@uos.de",
+        contact="sinukesus@uos.de",
     )  # noqa
 
     try:
@@ -535,9 +583,12 @@ def run_script():
         if os.path.exists(MOUNT_PATH):
             conn = BlitzGateway(client_obj=client)
 
-            datapath=checkWorkstation(conn,WORKSTATION_NAME,MOUNT_PATH,conn.getUser().getName())
+            datapath=checkWorkstation(conn,params.get(PARAM_WS),MOUNT_PATH,conn.getUser().getName())
             if datapath:
-                robj,message=remoteImport(conn,params,datapath,WORKSTATION_NS)
+                robj,message=remoteImport(conn,params,datapath)
+            else:
+                message = "No data available on %s for user"%(params.get(PARAM_WS))
+                robj=None
 
             client.setOutput("Message", rstring(message))
             if robj is not None:
