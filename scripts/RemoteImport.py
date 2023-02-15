@@ -1,38 +1,43 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
------------------------------------------------------------------------------
-  Copyright (C) 2021-2022 Susanne Kunis. All rights reserved.
+RemoteImport.py
 
+Start import via OMERO.script for data stored at one of the supported workstations.
+Source data are located under OMERO_ImportData/<username>/ on the selected workstation.
+Appends non-image files with specified suffixes to project or dataset.
+Possible configurations:
+* INPLACE_IMPORT = true: use inplace import instead of normal import
+* COPY_SOURCES = true: creates  directories in DATA_PATH like <username>_<userID>/yyyy-MM/dd/HH-mm-ss.SSS/
+ and transfer data before import to this target
 
+Usage:
+Select PROJECT as TARGET for import :
+A Dataset object is created for each subdirectory on OMERO_ImportData/<username>/
+The name of the dataset includes parent directory names. For example:
+/<mountpath>/dirA/dirB will result in datasetname: dirA_dirB
+
+Select DATASET as TARGET for import :
+All images (also images in subdirectories) are imported into this Dataset
+------------------------------------------------------------------------
+Copyright (C) 2022
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
-  the Free Software Foundation; either version 2 of the License, or
-  (at your option) any later version.
+  the Free Software Foundation; either version 3 of the License, or
+  (at your option) any later version (GPL-3.0-or-later).
   This program is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   GNU General Public License for more details.
-
   You should have received a copy of the GNU General Public License along
   with this program; if not, write to the Free Software Foundation, Inc.,
   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-
-------------------------------------------------------------------------------
-
-This script import images from a mounted directory into OMERO via cli import into the selected
-project or dataset dir. Attachment of non-image files to dataset or project directory if required.
-This can be limited to certain file extensions.
-The mounted source path is MOUNT_PATH/WORKSTATION_NAME[i]/<omero_username> (see also checkWorkstation())and import from the source system a
-dedicated <omero_username> directory (implemented via automount).
-
-
+-------------------------------------------------------------------------
 @author Susanne Kunis
 <a href="mailto:sinukesus@gmail.com">sinukesus@gmail.com</a>
-@version 1.1.0
+@version 1.2.0
+
 """
-
-
 import omero.scripts as scripts
 from omero.gateway import BlitzGateway
 import os
@@ -41,20 +46,31 @@ import omero
 import omero.cli
 from omero.rtypes import rstring,unwrap,rlong,robject
 
+import shlex
+import subprocess
 import time
 import tempfile
 from pathlib import Path
 import threading
+import datetime
 import glob
+import shutil
+from concurrent.futures import ProcessPoolExecutor
 
 
 ############### CONFIGURATIONS ######################################
-# Set the number of directories to scan down for files :
+# Set the number of directories to scan down for files during the import:
 DEPTH= 10
-# path of the directory for automount
-MOUNT_PATH = "/AutoMountDir/"
-# Name of the system registered with Automount
-WORKSTATION_NAMES=["system1","system2"]
+# storage location for data for inplace import
+DATA_PATH= "/storage/OMERO_inplace/users/"
+# enable/disable inplace_import
+INPLACE_IMPORT = True
+# enable/disable transfer of data to directory specified under DATA_PATH
+COPY_SOURCES = True
+# main directory of mount points
+MOUNT_PATH = "/Importer/"
+# mount point names/ workstations
+WORKSTATION_NAMES=["cn-imaris","cn-lattice","cn-airyscan"]
 
 #####################################################################
 
@@ -68,6 +84,23 @@ PARAM_SKIP_EXISTING = "Skip already imported files"
 
 IDLETIME = 5
 
+
+def get_formated_date():
+    dt = datetime.datetime.now()
+    year_m=dt.strftime("%Y-%m")
+    day=dt.strftime("%d")
+    time=dt.strftime("%H-%M-%S.%f")[:-3]
+
+    return year_m,day,time
+
+# creates directories: <username>_<userID>/yyyy-MM/dd/HH-mm-ss.SSS/
+def create_new_repo_path(conn):
+    p1= "%s_%s"%(conn.getUser().getName(),conn.getUser().getId())
+    p2,p3,p4=get_formated_date()
+    repo_path=os.path.join(DATA_PATH, os.path.join(os.path.join(os.path.join(p1, p2), p3), p4))
+    print(repo_path)
+    os.makedirs(repo_path, exist_ok=True)
+    return repo_path
 
 def createDataset(conn,pID,dName):
     # create dataset for experiment dir
@@ -109,12 +142,16 @@ def getImportTarget(conn,params):
 def createArgumentList(ipath,id,skip,depth):
     import_args =["import"]
     import_args.extend(['-c']) # continue if errors
+    # TODO: skip for screendata and rename the created screen folder in omero like the given projectfolder's name?
+    if INPLACE_IMPORT:
+        import_args.extend(['--transfer=ln_s'])
+
     import_args.extend(['-d',str(id)])
     import_args.extend(['--parallel-fileset','2'])
     import_args.extend(['--parallel-upload','2'])
     import_args.extend(['--no-upgrade-check'])
     import_args.extend(['--depth',str(depth)])
-    if skip:
+    if skip and not COPY_SOURCES:
         import_args.extend(["--exclude=clientpath"])
 
     import_args.extend([Path(ipath).resolve().as_posix().replace("\ "," ")])
@@ -262,7 +299,7 @@ def attachFiles(conn, destID, destType,values,srcPath,namespace,depth):
 def cliImport(client,ipath,destID,skip,depth,namespace,dataset=None,conn=None):
     # create import call string
     args = createArgumentList(ipath,destID,skip,depth)
-
+    print(args)
     images_skipped = None
     images_imported = None
 
@@ -325,44 +362,17 @@ def retryImport(client, destinationID, filesForNewlyImport, images_skipped, numO
 
 
 def importContent(conn, params,jobs,depth):
+    message=None
     try:
         namespace = params.get(PARAM_WS)
-        client = conn.c
-        #see https://lists.openmicroscopy.org.uk/pipermail/ome-users/2014-September/004783.html
-        router = client.getProperty("Ice.Default.Router")
-        router = client.getCommunicator().stringToProxy(router)
-        for endpoint in router.ice_getEndpoints():
-            client.ic.getProperties().setProperty("omero.host",endpoint.getInfo().host)
-            break
-        else:
-            raise Exception("no host configuration found")
-
-        s = client.getSession()
-        re = s.createRenderingEngine()
-
-        #see also https://gist.github.com/jacques2020/ee863e83c3e2b663d68f
-        # necessary anymore?
-        class KeepAlive(threading.Thread):
-            def run(self):
-                self.stop = False
-                while not self.stop:
-                    time.sleep(IDLETIME)
-                    try:
-                        s.keepAllAlive([re])
-                    except:
-                        client.closeSession()
-                        raise
-
-        keepAlive = KeepAlive()
-        keepAlive.start()
-        time.sleep(IDLETIME * 2)
+        client=conn.c
 
         all_skipped_img=[]
         all_notImported_img=[]
 
         for ipath in jobs:
             if ipath is not None:
-                ipath = ipath.replace(" ", "\\ ")
+
                 print("#--------------------------------------------------------------------\n")
                 destID =jobs[ipath]
                 destDataset = conn.getObject('Dataset', destID)
@@ -371,6 +381,7 @@ def importContent(conn, params,jobs,depth):
                     skip=params.get(PARAM_SKIP_EXISTING)
 
                     # call import
+                    ipath = ipath.replace(" ", "\\ ")
                     print("\n Import files from : %s \n"%ipath)
                     images_skipped,images_imported,log=cliImport(client,ipath,destID,skip,depth,namespace,destDataset,conn)
 
@@ -390,13 +401,13 @@ def importContent(conn, params,jobs,depth):
                     all_notImported_img.extend(not_imported_imgList)
                     all_skipped_img.extend(images_skipped)
 
-
+    # todo attach files in separates try catch
     except Exception as e: # work on python 3.x
         exc_type, exc_obj, exc_tb = sys.exc_info()
         print ('ERROR: Failed to import: %s\n %s %s'%(str(e),exc_type, exc_tb.tb_lineno))
         return "ERROR"
     finally:
-        keepAlive.stop = True
+
         if all_notImported_img is not None and len(all_notImported_img)>0:
             print(messageRetry)
             print("NOT IMPORTED FILES:")
@@ -426,7 +437,7 @@ def scanSubdir(conn,currentdir,pName,jobs,destObj):
         currentdir = currentdir + os.sep
     dName = os.path.split(os.path.dirname(currentdir))[1]
     if pName:
-        datasetName = "%s__%s"%(pName,dName)
+        datasetName = "%s_%s"%(pName,dName)
     else:
         datasetName = dName
 
@@ -475,6 +486,52 @@ def getJobsAndTargets(conn,datapath,destType,destID,destObj,namespace):
 
         return jobs,1
 
+
+# copy files from source to destination
+def copy_files(src_paths, dest_dir):
+    # process all file paths
+    for src_path in src_paths:
+        # copy source file to dest file
+        dest_path = shutil.copy(src_path, dest_dir)
+        # report progress
+        print(f'.copied {src_path} to {dest_path}', flush=True)
+
+
+def transfer_data(conn,src):
+    # see https://superfastpython.com/multithreaded-file-copying/
+    # create the destination directory if needed
+    dest=create_new_repo_path(conn)
+
+    cmd="cp -r %s %s"%(os.path.join(src,"*"),dest)
+    status=subprocess.call(cmd, shell=True)
+    if status != 0:
+        if status < 0:
+            print("Killed by signal", status)
+        else:
+            print("Command failed with return code - ", status)
+
+    multithreaded=False
+    if multithreaded:
+        # create full paths for all files we wish to copy
+        files = [os.path.join(src,name) for name in os.listdir(src)]
+        print("# files:",len(files))
+        # determine chunksize
+        n_workers = 4
+        chunksize = round(len(files) / n_workers)
+        if chunksize==0:
+            chunksize=1
+        # create the process pool
+        with ProcessPoolExecutor(n_workers) as exe:
+            # split the copy operations into chunks
+            for i in range(0, len(files), chunksize):
+                # select a chunk of filenames
+                filenames = files[i:(i + chunksize)]
+                # submit the batch copy task
+                _ = exe.submit(copy_files, filenames, dest)
+        print('Done')
+    return dest
+
+
 def remoteImport(conn,params,datapath):
     destID,destObj,destType=getImportTarget(conn,params)
     if destObj is None:
@@ -485,10 +542,31 @@ def remoteImport(conn,params,datapath):
 
     startTime = time.time()
 
+    client = conn.c
+    #see https://lists.openmicroscopy.org.uk/pipermail/ome-users/2014-September/004783.html
+    router = client.getProperty("Ice.Default.Router")
+    router = client.getCommunicator().stringToProxy(router)
+    for endpoint in router.ice_getEndpoints():
+        client.ic.getProperties().setProperty("omero.host",endpoint.getInfo().host)
+        break
+    else:
+        raise Exception("no host configuration found")
+
+    s = client.getSession()
+    re = s.createRenderingEngine()
+
+    time.sleep(IDLETIME * 2)
+
+    if COPY_SOURCES:
+        # copy files to server
+        datapath=transfer_data(conn,datapath)
+
     jobs,depth = getJobsAndTargets(conn,datapath,destType,destID,destObj,params.get(PARAM_WS))
+
     if jobs is None:
         return destObj,"No files found!"
 
+    print("\n Import sources and destinations:")
     for key in jobs:
         print(key, '->', jobs[key])
 
@@ -537,51 +615,92 @@ def run_script():
     The main entry point of the script, as called by the client via the
     scripting service, passing the required parameters.
     """
-    client = scripts.client(
-        'Remote_Import.py',
-        """Remote import from dedicated workstations:
-
-        * Import the content of the OMERO_ImportData/<username>/ folder on the selected workstation.
-        * Appends files with the specified suffix to the Project or Dataset.
-        * The scanned subfolder depth is 10
-        ---------------------------------------------------------------
-        INPUT:
-        ---------------------------------------------------------------
-        Select PROJECT as TARGET for import : : A Dataset object is created for each subdirectory on OMERO_ImportData/<username>/
-
-        Select DATASET as TARGET for import : : All images (also images in subdirectories) are imported into this Dataset
-
-
-        """,
-        scripts.String(PARAM_WS, optional=False, grouping="1",
-                       description="Choose a workstation where you want to import from",
-                       values=WORKSTATION_NAMES),
-        scripts.String(PARAM_DATATYPE, optional=True, grouping="2",
-                       description="Choose kind of destination object.",
-                       values=dataTypes),
-        scripts.Long(PARAM_ID, optional=False, grouping="3",
-                     description="ID of destination object. Please select only ONE object."),
-        scripts.Bool(PARAM_SKIP_EXISTING, grouping="4",
-                     description="skip files that are already uploaded (checked 'import from' path).",
-                     default=False),
-        scripts.Bool(PARAM_ATTACH, grouping="5",
-                     description="Attach containing non image files", default=False),
-        scripts.String(PARAM_DEST_ATTACH, grouping="5.1",
-                       description="Object to that should be attach",
-                       values=dataTypes_attach, default="Dataset"),
-        scripts.String(PARAM_ATTACH_FILTER, grouping="5.2",
-                       description="Filter files by given file extension (for example txt, pdf). Separated by ','."),
-        namespaces=[omero.constants.namespaces.NSDYNAMIC],
-        version="1.1.0",
-        authors=["Susanne Kunis", "CellNanOs"],
-        institutions=["University of Osnabrueck"],
-        contact="sinukesus@uos.de",
+    if COPY_SOURCES:
+        client = scripts.client(
+            'Remote_Import.py',
+            """Remote import from dedicated workstations:
+            
+            * Copy the content of OMERO_ImportData/<username>/ folder to the OMERO.server and import the data into OMERO.
+            * Appends files with the specified suffix to the Project or Dataset.
+            * The scanned subfolder depth is 10
+            ---------------------------------------------------------------
+            INPUT:
+            ---------------------------------------------------------------
+            Select PROJECT as TARGET for import : : A Dataset object is created for each subdirectory on OMERO_ImportData/<username>/
+    
+            Select DATASET as TARGET for import : : All images (also images in subdirectories) are imported into this Dataset
+    
+    
+            """,
+            # skip already imported files will not work, because the source path change because of the timestamp
+            scripts.String(PARAM_WS, optional=False, grouping="1",
+                           description="Choose a workstation where you want to import from",
+                           values=WORKSTATION_NAMES),
+            scripts.String(PARAM_DATATYPE, optional=True, grouping="2",
+                           description="Choose kind of destination object.",
+                           values=dataTypes),
+            scripts.Long(PARAM_ID, optional=False, grouping="3",
+                         description="ID of destination object. Please select only ONE object."),
+            scripts.Bool(PARAM_ATTACH, grouping="5",
+                         description="Attach containing non image files", default=False),
+            scripts.String(PARAM_DEST_ATTACH, grouping="5.1",
+                           description="Object to that should be attach",
+                           values=dataTypes_attach, default="Dataset"),
+            scripts.String(PARAM_ATTACH_FILTER, grouping="5.2",
+                           description="Filter files by given file extension (for example txt, pdf). Separated by ','."),
+            namespaces=[omero.constants.namespaces.NSDYNAMIC],
+            version="1.1.0",
+            authors=["Susanne Kunis", "CellNanOs"],
+            institutions=["University of Osnabrueck"],
+            contact="sukunis@uos.de",
+        )
+    else:
+        client = scripts.client(
+            'Remote_Import.py',
+            """Remote import from dedicated workstations:
+    
+            * Import the content of the OMERO_ImportData/<username>/ folder on the selected workstation.
+            * Appends files with the specified suffix to the Project or Dataset.
+            * The scanned subfolder depth is 10
+            ---------------------------------------------------------------
+            INPUT:
+            ---------------------------------------------------------------
+            Select PROJECT as TARGET for import : : A Dataset object is created for each subdirectory on OMERO_ImportData/<username>/
+    
+            Select DATASET as TARGET for import : : All images (also images in subdirectories) are imported into this Dataset
+    
+    
+            """,
+            scripts.String(PARAM_WS, optional=False, grouping="1",
+                           description="Choose a workstation where you want to import from",
+                           values=WORKSTATION_NAMES),
+            scripts.String(PARAM_DATATYPE, optional=True, grouping="2",
+                           description="Choose kind of destination object.",
+                           values=dataTypes),
+            scripts.Long(PARAM_ID, optional=False, grouping="3",
+                         description="ID of destination object. Please select only ONE object."),
+            scripts.Bool(PARAM_SKIP_EXISTING, grouping="4",
+                         description="skip files that are already uploaded (checked 'import from' path).",
+                         default=False),
+            scripts.Bool(PARAM_ATTACH, grouping="5",
+                         description="Attach containing non image files", default=False),
+            scripts.String(PARAM_DEST_ATTACH, grouping="5.1",
+                           description="Object to that should be attach",
+                           values=dataTypes_attach, default="Dataset"),
+            scripts.String(PARAM_ATTACH_FILTER, grouping="5.2",
+                           description="Filter files by given file extension (for example txt, pdf). Separated by ','."),
+            namespaces=[omero.constants.namespaces.NSDYNAMIC],
+            version="1.2.0",
+            authors=["Susanne Kunis", "CellNanOs"],
+            institutions=["University of Osnabrueck"],
+           
     )  # noqa
 
     try:
         params = client.getInputs(unwrap=True)
         if os.path.exists(MOUNT_PATH):
             conn = BlitzGateway(client_obj=client)
+            conn.c.enableKeepAlive(60)
 
             datapath=checkWorkstation(conn,params.get(PARAM_WS),MOUNT_PATH,conn.getUser().getName())
             if datapath:
