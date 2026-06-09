@@ -5,7 +5,7 @@
 Module Name: OMERO.script FetchAndAttach.py
 Description: Grab the files from a selected workstation listed in WORKSTATION_NAMES, copy them to the in-place data directory DATA_PATH, and add them as attachments (symlink in OMERO_DATA_DIR =inplace attachment) to the selected OMERO object.
 Prerequisite: Workstations are configured for automatic mounting on MOUNT_PATH for the OMERO server.
-Author: Susanne Kunis <sukunis@uos.de>
+Author: Susanne Kunis <sinukesus@gmail.com>
 Date: 2026-06-09
 License: GPL v3
 Version: 1.0.0
@@ -227,7 +227,7 @@ def run_script():
         version="1.0.0",
         authors=["Susanne Kunis", "CellNanOs"],
         institutions=["University of Osnabrueck"],
-        contact="sukunis@uos.de",
+        contact="sinukesus@gmail.com",
     )
 
     try:
